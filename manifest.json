@@ -1,7 +1,7 @@
 {
   "plugin_id": "sakuramedia_guangyapan_provider",
   "display_name": "光鸭云盘",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "host_api_version": 8,
   "requires_python": ">=3.10,<3.11",
   "dependencies": [],
