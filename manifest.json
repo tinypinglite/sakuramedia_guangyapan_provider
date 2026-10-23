@@ -1,0 +1,10 @@
+{
+  "plugin_id": "sakuramedia_guangyapan_provider",
+  "display_name": "光鸭云盘",
+  "version": "0.0.1-beta.1",
+  "host_api_version": 8,
+  "requires_python": ">=3.10,<3.11",
+  "dependencies": [],
+  "author": "SakuraMedia",
+  "release_api_url": "https://api.github.com/repos/tinypinglite/sakuramedia_guangyapan_provider/releases/latest"
+}
