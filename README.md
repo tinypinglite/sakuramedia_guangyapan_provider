@@ -40,3 +40,9 @@
 
 ## 注意
 需要开通光鸭云盘会员后使用.
+
+## License
+
+本项目采用 [PolyForm Noncommercial License 1.0.0](./LICENSE)，仅允许非商业用途。
+
+Copyright (C) 2026 tinypinglite
