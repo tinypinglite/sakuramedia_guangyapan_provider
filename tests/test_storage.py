@@ -819,3 +819,313 @@ def test_read_budget_exceeded_is_not_retryable() -> None:
     assert error.code == "unavailable"
     assert error.retryable is False
     assert "预算" in error.safe_message
+
+
+class DetailClient(FakeClient):
+    """按 file_id 定制详情响应，用于覆盖父链边界。"""
+
+    def __init__(
+        self,
+        details: dict[str, dict] | None = None,
+        errors: dict[str, Exception] | None = None,
+    ) -> None:
+        super().__init__()
+        self.details = details or {}
+        self.errors = errors or {}
+        self.detail_calls: list[str] = []
+
+    def file_detail(self, file_id):
+        self.detail_calls.append(file_id)
+        error = self.errors.get(file_id)
+        if error is not None:
+            raise error
+        if file_id in self.details:
+            return self.details[file_id]
+        return super().file_detail(file_id)
+
+
+def _install_detail_client(
+    provider: GuangyapanStorageProvider,
+    details: dict[str, dict] | None = None,
+    errors: dict[str, Exception] | None = None,
+) -> DetailClient:
+    client = DetailClient(details=details, errors=errors)
+    provider._client = client
+    provider._playback = GuangyapanPlayback(client)
+    return client
+
+
+def _dir_source_ref(file_id: str) -> dict:
+    return {"v": 1, "kind": "guangyapan_dir", "file_id": file_id}
+
+
+def _entry_source_ref(file_id: str, *, parent_id: str | None = None) -> dict:
+    ref = {"v": 1, "kind": "guangyapan_entry", "file_id": file_id}
+    if parent_id is not None:
+        ref["parent_id"] = parent_id
+    return ref
+
+
+@pytest.mark.parametrize(
+    "source_disposition", ["keep", "delete_after_commit", "in_place"]
+)
+def test_validate_import_source_rejects_media_root(
+    provider: GuangyapanStorageProvider, source_disposition: str
+) -> None:
+    client = _install_detail_client(provider, details={MEDIA_ROOT: {"fileId": MEDIA_ROOT}})
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_dir_source_ref(MEDIA_ROOT),
+            source_disposition=source_disposition,
+        )
+
+    assert error.value.code == "invalid_config"
+    assert client.detail_calls == []
+
+
+def test_validate_import_source_rejects_descendant_of_media_root(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={MEDIA_ROOT: {"fileId": MEDIA_ROOT}, "50": {"fileId": "50", "parentId": MEDIA_ROOT}},
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_dir_source_ref("50"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert client.detail_calls == ["50"]
+
+
+def test_validate_import_source_rejects_account_root(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(provider)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_dir_source_ref(""),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert client.detail_calls == []
+
+
+def test_validate_import_source_allows_disjoint_directory(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={MEDIA_ROOT: {"fileId": MEDIA_ROOT}, "1": {"fileId": "1"}},
+    )
+
+    provider.validate_import_source(
+        source_ref=_dir_source_ref("1"),
+        source_disposition="keep",
+    )
+
+    assert client.detail_calls == ["1", MEDIA_ROOT]
+
+
+def test_validate_import_source_rejects_everything_when_media_root_is_account_root(
+    tmp_path: Path,
+) -> None:
+    provider = GuangyapanStorageProvider(
+        library=LibraryHandle(
+            library_id=7,
+            provider_key="guangyapan",
+            provider_config={"refresh_token": "gy.test", "media_root_id": ""},
+            account_key="sub",
+        ),
+        data_dir=tmp_path / "plugin-data",
+    )
+    client = _install_detail_client(provider)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_dir_source_ref("1"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert client.detail_calls == []
+
+
+def test_validate_import_source_uses_entry_parent_id(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={MEDIA_ROOT: {"fileId": MEDIA_ROOT}, "1": {"fileId": "1"}},
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("50", parent_id=MEDIA_ROOT),
+            source_disposition="keep",
+        )
+    assert error.value.code == "invalid_config"
+
+    provider.validate_import_source(
+        source_ref=_entry_source_ref("2", parent_id="1"),
+        source_disposition="keep",
+    )
+    assert client.detail_calls == ["1"]
+
+
+def test_validate_import_source_treats_top_level_entry_without_parent_as_root(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={
+            "9": {"fileId": "9", "fileName": "root.mp4", "resType": 1, "fileSize": 100},
+        },
+    )
+
+    provider.validate_import_source(
+        source_ref=_entry_source_ref("9"),
+        source_disposition="keep",
+    )
+
+    assert client.detail_calls == ["9"]
+
+
+def test_validate_import_source_resolves_entry_parent_from_file_detail(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={
+            MEDIA_ROOT: {"fileId": MEDIA_ROOT},
+            "50": {"fileId": "50", "parentId": MEDIA_ROOT},
+        },
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("50"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert client.detail_calls == ["50"]
+
+
+def test_validate_import_source_uses_full_parent_ids_fallback(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client = _install_detail_client(
+        provider,
+        details={
+            MEDIA_ROOT: {"fileId": MEDIA_ROOT},
+            "60": {"fileId": "60", "fullParentIds": f"0/{MEDIA_ROOT}"},
+            "61": {"fileId": "61", "fullParentIds": "0/1"},
+            "1": {"fileId": "1"},
+        },
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("60"),
+            source_disposition="keep",
+        )
+    assert error.value.code == "invalid_config"
+
+    provider.validate_import_source(
+        source_ref=_entry_source_ref("61"),
+        source_disposition="keep",
+    )
+    assert client.detail_calls == ["60", "61", "1"]
+
+
+def test_validate_import_source_rejects_missing_source(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    _install_detail_client(provider, details={"50": {}})
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("50"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"
+
+
+def test_validate_import_source_maps_api_failure_to_unavailable(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    _install_detail_client(
+        provider,
+        errors={"50": GuangyapanRequestError("boom")},
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("50"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "unavailable"
+    assert error.value.retryable is True
+
+
+def test_validate_import_source_rejects_parent_cycle(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    _install_detail_client(
+        provider,
+        details={
+            "A": {"fileId": "A", "parentId": "B"},
+            "B": {"fileId": "B", "parentId": "A"},
+        },
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("A"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "unavailable"
+    assert error.value.retryable is True
+
+
+def test_validate_import_source_rejects_over_deep_parent_chain(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    details = {
+        str(index): {"fileId": str(index), "parentId": str(index + 1)}
+        for index in range(65)
+    }
+    client = _install_detail_client(provider, details=details)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("0"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "unavailable"
+    assert error.value.retryable is True
+    # 先解析 entry 自身父目录 1 次，再沿父链最多走 64 步。
+    assert len(client.detail_calls) == 65
+
+
+def test_validate_import_source_rejects_invalid_ref(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref={"v": 2, "kind": "guangyapan_dir", "file_id": "1"},
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"

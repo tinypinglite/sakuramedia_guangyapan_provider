@@ -89,6 +89,7 @@ _THUMBNAIL_INTERVAL_SECONDS = 10
 _THUMBNAIL_READ_CHUNK_BYTES = 64 * 1024
 _IMPORT_DIRECTORY_CACHE_BATCHES = 4
 _IMPORT_OP_DIRECTORY_PREFIX = "op-"
+_MAX_ANCESTOR_DEPTH = 64
 
 _VIDEO_SUFFIXES = frozenset(
     {
@@ -354,6 +355,95 @@ class GuangyapanStorageProvider:
         except GuangyapanError as exc:
             self._log_failure("scan_import_source", exc, "")
             raise _cloud_error("scan_import_source", exc) from exc
+
+    def validate_import_source(
+        self, *, source_ref: JsonObject, source_disposition: str
+    ) -> None:
+        operation = "validate_import_source"
+        if not isinstance(source_ref, dict):
+            raise _error(operation, "source_not_found", "光鸭导入源无效")
+        kind = source_ref.get("kind")
+        if source_ref.get("v") != REF_VERSION or kind not in {
+            DIR_REF_KIND,
+            ENTRY_REF_KIND,
+        }:
+            raise _error(operation, "source_not_found", "光鸭导入源无效")
+        file_id = source_ref.get("file_id")
+        if not isinstance(file_id, str):
+            raise _error(operation, "source_not_found", "光鸭导入源无效")
+        media_root = self._media_root_id
+        if media_root == "":
+            raise self._overlap_error()
+        if kind == DIR_REF_KIND:
+            if file_id == "":
+                raise self._overlap_error()
+            if self._is_at_or_below(file_id, media_root) or self._is_at_or_below(
+                media_root, file_id
+            ):
+                raise self._overlap_error()
+            return
+        if not file_id:
+            raise _error(operation, "source_not_found", "光鸭导入源无效")
+        parent_id = source_ref.get("parent_id")
+        if not isinstance(parent_id, str):
+            parent_id = self._parent_id(file_id)
+        if parent_id and self._is_at_or_below(parent_id, media_root):
+            raise self._overlap_error()
+
+    def _is_at_or_below(self, start_id: str, ancestor_id: str) -> bool:
+        current = start_id
+        visited: set[str] = set()
+        for _ in range(_MAX_ANCESTOR_DEPTH):
+            if current == ancestor_id:
+                return True
+            if not current:
+                return False
+            if current in visited:
+                raise self._unavailable_error()
+            visited.add(current)
+            current = self._parent_id(current)
+        raise self._unavailable_error()
+
+    def _parent_id(self, file_id: str) -> str:
+        detail = self._file_detail(file_id)
+        parent = detail.get("parentId")
+        if isinstance(parent, str):
+            return parent
+        full = detail.get("fullParentIds")
+        if isinstance(full, str):
+            parts = [part for part in full.split("/") if part]
+            return parts[-1] if parts else ""
+        # 顶层目录/文件实测没有 parentId/fullParentIds：视为根。
+        return ""
+
+    def _file_detail(self, file_id: str) -> JsonObject:
+        try:
+            detail = self._client.file_detail(file_id)
+        except GuangyapanError as exc:
+            self._log_failure("validate_import_source", exc, file_id)
+            raise _cloud_error("validate_import_source", exc) from exc
+        if not isinstance(detail, dict) or not detail:
+            raise _error(
+                "validate_import_source", "source_not_found", "光鸭导入源不存在"
+            )
+        return detail
+
+    @staticmethod
+    def _overlap_error() -> ProviderOperationError:
+        return _error(
+            "validate_import_source",
+            "invalid_config",
+            "光鸭导入源与媒体库目录重叠，请选择媒体库目录之外的位置",
+        )
+
+    @staticmethod
+    def _unavailable_error() -> ProviderOperationError:
+        return _error(
+            "validate_import_source",
+            "unavailable",
+            "无法校验导入源与媒体库目录的关系，请稍后重试",
+            retryable=True,
+        )
 
     @staticmethod
     def _import_file(item: JsonObject, *, relative_path: str) -> ImportFile:
