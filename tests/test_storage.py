@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
 from sakuramedia_guangyapan_provider import range_reader as range_reader_module
 from sakuramedia_guangyapan_provider.exceptions import (
+    GuangyapanNotFoundError,
     GuangyapanObjectNotReadyError,
     GuangyapanReadBudgetExceeded,
     GuangyapanRequestError,
@@ -763,12 +763,26 @@ def test_playback_redirects_by_default(provider: GuangyapanStorageProvider) -> N
 
 
 class FakeTransferSource:
-    def __init__(self, path: Path, *, name: str = "transfer.mp4") -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        name: str = "transfer.mp4",
+        content_md5: str | None = None,
+        content_sha1: str | None = None,
+    ) -> None:
         self._path = path
-        self.info = SimpleNamespace(file_name=name, size_bytes=path.stat().st_size)
+        self.info = SimpleNamespace(
+            file_name=name,
+            size_bytes=path.stat().st_size,
+            content_md5=content_md5,
+            content_sha1=content_sha1,
+        )
         self.asserted = 0
+        self.reads = 0
 
     def open_reader(self):
+        self.reads += 1
         return LocalReader(self._path)
 
     def assert_unchanged(self) -> None:
@@ -782,7 +796,10 @@ def test_stage_transfer_uses_instant_upload_only(
     source_path = tmp_path / "transfer.mp4"
     source_path.write_bytes(payload)
     result = provider.stage_transfer(
-        source=FakeTransferSource(source_path),
+        source=FakeTransferSource(
+            source_path,
+            content_md5=hashlib.md5(payload).hexdigest().upper(),
+        ),
         placement=ImportPlacement(relative_path="videos/transfer.mp4"),
         operation_key="move:0",
     )
@@ -800,12 +817,171 @@ def test_stage_transfer_reports_not_available_without_instant_upload(
     source_path = tmp_path / "other.mp4"
     source_path.write_bytes(b"y" * 512)
     result = provider.stage_transfer(
-        source=FakeTransferSource(source_path, name="other.mp4"),
+        source=FakeTransferSource(
+            source_path,
+            name="other.mp4",
+            content_md5=hashlib.md5(b"y" * 512).hexdigest().upper(),
+        ),
         placement=ImportPlacement(relative_path="videos/other.mp4"),
         operation_key="move:1",
     )
     assert result.status == "not_available"
     assert result.storage_ref is None
+
+
+def test_stage_transfer_reuses_cached_md5_without_reading_source(
+    provider: GuangyapanStorageProvider, tmp_path: Path
+) -> None:
+    source_path = tmp_path / "transfer.mp4"
+    source_path.write_bytes(b"payload")
+
+    class NoReadSource(FakeTransferSource):
+        def open_reader(self):
+            raise AssertionError("cached MD5 must not read the source")
+
+    result = provider.stage_transfer(
+        source=NoReadSource(source_path, content_md5="B" * 32),
+        placement=ImportPlacement(relative_path="videos/transfer.mp4"),
+        operation_key="move:cached-md5",
+    )
+
+    client: FakeClient = provider._client  # type: ignore[assignment]
+    assert result.status == "staged"
+    assert client.upload_tokens[-1]["md5"] == "B" * 32
+
+
+def test_stage_transfer_skips_without_cached_md5(
+    provider: GuangyapanStorageProvider, tmp_path: Path
+) -> None:
+    source_path = tmp_path / "transfer.mp4"
+    source_path.write_bytes(b"payload")
+    client: FakeClient = provider._client  # type: ignore[assignment]
+    source = FakeTransferSource(source_path)
+
+    result = provider.stage_transfer(
+        source=source,
+        placement=ImportPlacement(relative_path="videos/transfer.mp4"),
+        operation_key="move:no-md5",
+    )
+
+    assert result.status == "not_available"
+    assert source.reads == 0
+    assert client.created_dirs == []
+    assert client.upload_tokens == []
+
+
+def test_open_transfer_source_uses_only_media_hashes(
+    provider: GuangyapanStorageProvider, monkeypatch
+) -> None:
+    def fail_detail(_file_id):
+        raise AssertionError("opening a transfer source must not access 光鸭")
+
+    monkeypatch.setattr(provider._client, "file_detail", fail_detail)
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=_media_ref("2"),
+        file_name="A.mp4",
+        file_size_bytes=2048,
+        duration_seconds=0,
+        content_md5="B" * 32,
+        content_sha1="A" * 40,
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        assert source.info.content_md5 == "B" * 32
+        assert source.info.content_sha1 == "A" * 40
+        source.assert_unchanged()
+
+
+def test_open_transfer_source_drops_invalid_media_hashes(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=_media_ref("2"),
+        file_name="A.mp4",
+        file_size_bytes=2048,
+        duration_seconds=0,
+        content_md5="invalid",
+        content_sha1="",
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        assert source.info.content_md5 is None
+        assert source.info.content_sha1 is None
+
+
+def test_cleanup_transfer_source_deletes_original_file(
+    provider: GuangyapanStorageProvider,
+) -> None:
+    client: FakeClient = provider._client  # type: ignore[assignment]
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=_media_ref("2"),
+        file_name="A.mp4",
+        file_size_bytes=2048,
+        duration_seconds=0,
+        content_sha1="A" * 40,
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        provider.cleanup_transfer_source(media=media, source=source)
+
+    assert client.deleted == [["2"]]
+
+
+def test_cleanup_transfer_source_accepts_missing_file(
+    provider: GuangyapanStorageProvider, monkeypatch
+) -> None:
+    client: FakeClient = provider._client  # type: ignore[assignment]
+
+    def delete_missing(_file_ids):
+        raise GuangyapanNotFoundError("missing")
+
+    monkeypatch.setattr(client, "delete_files", delete_missing)
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=_media_ref("2"),
+        file_name="A.mp4",
+        file_size_bytes=2048,
+        duration_seconds=0,
+        content_sha1="A" * 40,
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        provider.cleanup_transfer_source(media=media, source=source)
+
+    assert client.deleted == []
+
+
+def test_cleanup_transfer_source_maps_delete_errors(
+    provider: GuangyapanStorageProvider, monkeypatch
+) -> None:
+    client: FakeClient = provider._client  # type: ignore[assignment]
+
+    def delete_failed(_file_ids):
+        raise GuangyapanRequestError("failed")
+
+    monkeypatch.setattr(client, "delete_files", delete_failed)
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=_media_ref("2"),
+        file_name="A.mp4",
+        file_size_bytes=2048,
+        duration_seconds=0,
+        content_sha1="A" * 40,
+    )
+
+    with (
+        provider.open_transfer_source(media=media) as source,
+        pytest.raises(ProviderOperationError),
+    ):
+        provider.cleanup_transfer_source(media=media, source=source)
 
 
 def test_read_budget_exceeded_is_not_retryable() -> None:

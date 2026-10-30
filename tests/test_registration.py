@@ -19,6 +19,7 @@ def test_registration_declares_provider(tmp_path: Path) -> None:
     bundle = validate_media_provider_extension(plugin_id=PLUGIN_ID, extension=extension)
 
     assert registration.host_api_version == manifest["host_api_version"]
+    assert manifest["host_api_version"] == 14
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "guangyapan"
     assert bundle.playback_deliveries == ("redirect", "proxy")

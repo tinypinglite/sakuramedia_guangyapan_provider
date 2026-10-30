@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -33,6 +34,8 @@ from src.plugins.provider_protocol import (
     JsonObject,
     LibraryHandle,
     MediaHandle,
+    MediaTransferSource,
+    MediaTransferSourceInfo,
     ProviderOperationError,
     StagedMedia,
     StagedMediaTransfer,
@@ -81,6 +84,7 @@ _COVER_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 _PROBE_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 _THUMBNAIL_MAX_FETCHED_BYTES = 1024 * 1024 * 1024
 _CLIP_MAX_FETCHED_BYTES = 1024 * 1024 * 1024
+_TRANSFER_SOURCE_RANGE_CHUNK_BYTES = 64 * 1024
 
 # 固定采样间隔（秒）：与 115 插件一致，不由用户配置。
 _THUMBNAIL_INTERVAL_SECONDS = 10
@@ -137,6 +141,12 @@ def _is_video(item: JsonObject) -> bool:
     if item.get("fileType") == 2:
         return True
     return PurePosixPath(str(item.get("fileName") or "")).suffix.lower() in _VIDEO_SUFFIXES
+
+
+def _valid_source_hash(value: object, length: int) -> str | None:
+    if isinstance(value, str) and re.fullmatch(rf"[0-9A-Fa-f]{{{length}}}", value):
+        return value
+    return None
 
 
 def _is_importable(item: JsonObject) -> bool:
@@ -224,6 +234,40 @@ def _import_request(
         "placement": str(getattr(placement, "relative_path", "") or ""),
         "source_disposition": source_disposition,
     }
+
+
+class _GuangyapanTransferSource:
+    def __init__(
+        self,
+        *,
+        provider: GuangyapanStorageProvider,
+        media: MediaHandle,
+        file_id: str,
+    ) -> None:
+        self._provider = provider
+        self._media = media
+        self.file_id = file_id
+        self.info = MediaTransferSourceInfo(
+            file_name=media.file_name,
+            size_bytes=media.file_size_bytes,
+            content_md5=_valid_source_hash(
+                getattr(media, "content_md5", None), 32
+            ),
+            content_sha1=_valid_source_hash(
+                getattr(media, "content_sha1", None), 40
+            ),
+        )
+
+    def open_reader(self) -> GuangyapanRangeReader:
+        return self._provider._reader(
+            self.file_id,
+            file_size=self._media.file_size_bytes,
+            max_fetched_bytes=None,
+            chunk_size=_TRANSFER_SOURCE_RANGE_CHUNK_BYTES,
+        )
+
+    def assert_unchanged(self) -> None:
+        return None
 
 
 class GuangyapanStorageProvider:
@@ -1215,6 +1259,30 @@ class GuangyapanStorageProvider:
 
     # ---------------------------------------------------------------- 可选：跨库迁移（仅秒传）
 
+    @contextmanager
+    def open_transfer_source(self, *, media: MediaHandle):
+        file_id = _entry_file_id(media.storage_ref, operation="open_transfer_source")
+        yield _GuangyapanTransferSource(
+            provider=self,
+            media=media,
+            file_id=file_id,
+        )
+
+    def cleanup_transfer_source(
+        self, *, media: MediaHandle, source: MediaTransferSource
+    ) -> None:
+        if (
+            not isinstance(source, _GuangyapanTransferSource)
+            or source._provider is not self
+            or source._media != media
+        ):
+            raise _error(
+                "cleanup_transfer_source",
+                "invalid_config",
+                "光鸭迁移源会话不匹配",
+            )
+        self._delete_files("cleanup_transfer_source", [source.file_id])
+
     def stage_transfer(
         self,
         *,
@@ -1237,14 +1305,24 @@ class GuangyapanStorageProvider:
                 "invalid_config",
                 "光鸭迁移目标文件名与源文件名不一致",
             )
+        md5 = getattr(info, "content_md5", None)
+        if not isinstance(md5, str) or re.fullmatch(r"[0-9A-Fa-f]{32}", md5) is None:
+            logger.info(
+                "光鸭迁移跳过：源媒体缺少 MD5 library_id={} operation_key={}",
+                self.library.library_id,
+                operation_key,
+            )
+            return StagedMediaTransfer(status="not_available")
+        source.assert_unchanged()
         try:
             parent_id, target_name, _placement_parent_id = self._ensure_placement_directory(
                 placement, operation_key=operation_key
             )
-            md5 = self._hash_transfer_source(source)
-            source.assert_unchanged()
             token = self._client.upload_token(
-                name=target_name, size=info.size_bytes, parent_id=parent_id, md5=md5
+                name=target_name,
+                size=info.size_bytes,
+                parent_id=parent_id,
+                md5=md5.upper(),
             )
             if not token.get("instant"):
                 logger.info(
@@ -1298,17 +1376,6 @@ class GuangyapanStorageProvider:
             file_name=target_name,
             size_bytes=info.size_bytes,
         )
-
-    @staticmethod
-    def _hash_transfer_source(source) -> str:
-        digest = hashlib.md5()
-        with source.open_reader() as reader:
-            while True:
-                chunk = reader.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        return digest.hexdigest().upper()
 
     def finalize_transfer(self, *, receipt: JsonObject) -> None:
         file_id = self._receipt_file_id(receipt, operation="finalize_transfer")
