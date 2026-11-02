@@ -19,12 +19,22 @@ def test_registration_declares_provider(tmp_path: Path) -> None:
     bundle = validate_media_provider_extension(plugin_id=PLUGIN_ID, extension=extension)
 
     assert registration.host_api_version == manifest["host_api_version"]
-    assert manifest["host_api_version"] == 14
+    assert manifest["version"] == "0.1.1"
+    assert manifest["host_api_version"] == 16
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "guangyapan"
     assert bundle.playback_deliveries == ("redirect", "proxy")
     assert bundle.downloads is not None
     assert tuple(bundle.downloads.config_fields) == ()
+    assert bundle.library_login.start_url == "https://www.guangyapan.com/"
+    assert bundle.library_login.allowed_hosts == ("guangyapan.com",)
+    assert bundle.library_login.local_storage_captures[0].origin == (
+        "https://www.guangyapan.com"
+    )
+    assert bundle.library_login.local_storage_captures[0].required_json_keys == (
+        "refresh_token",
+    )
+    assert bundle.library_login.managed_config_keys == ("refresh_token",)
 
     fields = {field.key: field for field in bundle.library_config_fields}
     assert fields["refresh_token"].input == "secret"

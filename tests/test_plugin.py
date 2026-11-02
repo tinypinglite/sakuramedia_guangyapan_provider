@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
-
 from sakuramedia_guangyapan_provider import plugin as plugin_module
 from sakuramedia_guangyapan_provider.plugin import GuangyapanMediaProviderBundle
+from typing_extensions import Self
 
 from src.plugins.provider_protocol import LibraryHandle, ProviderOperationError
 
@@ -19,7 +20,7 @@ class FakePrepareClient:
     def __init__(self, paths: dict[str, str]) -> None:
         self._paths = paths
 
-    def __enter__(self) -> "FakePrepareClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -53,6 +54,55 @@ def test_prepare_without_downloads_directory(bundle: GuangyapanMediaProviderBund
     assert prepared.provider_config["media_root_id"] == "100"
     assert prepared.provider_config["downloads_root_path"] == ""
     assert prepared.provider_config["downloads_root_id"] == ""
+
+
+def test_resolve_library_login_extracts_refresh_token(
+    bundle: GuangyapanMediaProviderBundle,
+) -> None:
+    prepared = bundle.resolve_library_login(
+        captured={
+            "local_storage": [
+                {
+                    "origin": "https://www.guangyapan.com",
+                    "items": {
+                        "credentials_client": json.dumps(
+                            {
+                                "refresh_token": "gy.login",
+                                "access_token": "ignored",
+                            }
+                        ),
+                        "unrelated": "value",
+                    },
+                }
+            ]
+        }
+    )
+
+    assert prepared.account_key == "asnK_test"
+    assert prepared.account_label == "asnK_test"
+    assert prepared.provider_config == {
+        "refresh_token": "gy.login",
+        "account_uid": "asnK_test",
+        "account_state": "会员（剩余约 30 天）",
+    }
+
+
+def test_resolve_library_login_rejects_missing_refresh_token(
+    bundle: GuangyapanMediaProviderBundle,
+) -> None:
+    with pytest.raises(ProviderOperationError) as excinfo:
+        bundle.resolve_library_login(
+            captured={
+                "local_storage": [
+                    {
+                        "origin": "https://www.guangyapan.com",
+                        "items": {"credentials_client": "{}"},
+                    }
+                ]
+            }
+        )
+
+    assert excinfo.value.code == "authentication_failed"
 
 
 def test_prepare_resolves_downloads_directory(bundle: GuangyapanMediaProviderBundle) -> None:

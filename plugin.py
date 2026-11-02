@@ -1,7 +1,7 @@
 """光鸭云盘 Provider 的注册与媒体库配置。
 
-登录方式：用户粘贴一次 `refresh_token`（见 README 的控制台取法）。实测该 token 不轮换、
-`access_token` 有效 2 小时由插件自动续期，所以用户只需要填这一次。
+登录方式优先使用宿主 WebView 登录窗口自动获取 `refresh_token`；高级设置仍兼容手动填写。
+实测该 token 不轮换、`access_token` 有效 2 小时由插件自动续期。
 """
 
 from __future__ import annotations
@@ -17,10 +17,12 @@ from src.plugins.provider_protocol import (
     ConfigField,
     JsonObject,
     LibraryHandle,
+    LibraryLoginSpec,
     PreparedLibrary,
+    PreparedLibraryLogin,
     ProviderOperationError,
+    WebLoginLocalStorageCapture,
 )
-
 from src.scheduler.contracts import JobDefinition
 
 from .exceptions import GuangyapanAuthError, GuangyapanError, safe_error_message
@@ -38,10 +40,23 @@ DISPLAY_NAME = "光鸭云盘"
 MANIFEST = json.loads(Path(__file__).with_name("manifest.json").read_text(encoding="utf-8"))
 VERSION = MANIFEST["version"]
 HOST_API_VERSION = MANIFEST["host_api_version"]
+LOGIN_STORAGE_ORIGIN = "https://www.guangyapan.com"
+
+LIBRARY_LOGIN = LibraryLoginSpec(
+    start_url="https://www.guangyapan.com/",
+    allowed_hosts=("guangyapan.com",),
+    local_storage_captures=(
+        WebLoginLocalStorageCapture(
+            origin=LOGIN_STORAGE_ORIGIN,
+            required_json_keys=("refresh_token",),
+        ),
+    ),
+    managed_config_keys=("refresh_token",),
+)
 
 _TOKEN_HELP = (
-    "在浏览器登录 www.guangyapan.com 后按 F12 打开控制台，粘贴 README 里的一行脚本，"
-    "把输出的 refresh_token 整段填到这里。只需填写一次，插件会自动续期。"
+    "仅在高级手动填写时使用：在浏览器登录 www.guangyapan.com 后按 F12 打开控制台，"
+    "按 README 的说明取出 refresh_token。插件会自动续期。"
 )
 
 LIBRARY_CONFIG_FIELDS = (
@@ -110,6 +125,7 @@ class GuangyapanMediaProviderBundle:
     provider_key = PROVIDER_KEY
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
+    library_login = LIBRARY_LOGIN
     playback_deliveries = ("redirect", "proxy")
 
     def __init__(self, *, data_dir: Path) -> None:
@@ -203,6 +219,50 @@ class GuangyapanMediaProviderBundle:
     def build_storage(self, *, library: LibraryHandle) -> GuangyapanStorageProvider:
         return GuangyapanStorageProvider(library=library, data_dir=self.data_dir)
 
+    def resolve_library_login(self, *, captured: JsonObject) -> PreparedLibraryLogin:
+        refresh_token = _captured_refresh_token(captured)
+        with GuangyapanClient(refresh_token) as client:
+            try:
+                account = client.user_me()
+                account_uid = str(account.get("sub") or "")
+                assets = client.assets()
+            except GuangyapanAuthError as exc:
+                logger.warning(
+                    "光鸭网页登录解析失败 reason={}", safe_error_message(exc)
+                )
+                raise _error(
+                    "library_login",
+                    "authentication_failed",
+                    "光鸭登录已失效，请重新登录",
+                ) from exc
+            except GuangyapanError as exc:
+                logger.warning(
+                    "光鸭网页登录解析失败 error_type={} reason={}",
+                    type(exc).__name__,
+                    safe_error_message(exc),
+                )
+                raise _error(
+                    "library_login",
+                    "unavailable",
+                    "光鸭服务暂不可用，请稍后重试",
+                    retryable=True,
+                ) from exc
+        if not account_uid:
+            raise _error(
+                "library_login",
+                "authentication_failed",
+                "光鸭账号信息无效，请重新登录",
+            )
+        return PreparedLibraryLogin(
+            provider_config={
+                "refresh_token": refresh_token,
+                "account_uid": account_uid,
+                "account_state": _describe_account(assets),
+            },
+            account_key=account_uid,
+            account_label=account_uid,
+        )
+
 
 def register(context: PluginContext) -> PluginRegistration:
     bundle = GuangyapanMediaProviderBundle(data_dir=context.data_dir)
@@ -248,6 +308,34 @@ def _describe_account(assets: JsonObject) -> str:
     if status == 1:
         return "非会员（光鸭三方应用能力可能不可用）"
     return "未知"
+
+
+def _captured_refresh_token(captured: JsonObject) -> str:
+    if not isinstance(captured, dict):
+        raise _error("library_login", "invalid_config", "光鸭登录信息无效")
+    for item in captured.get("local_storage", ()):
+        if not isinstance(item, dict) or item.get("origin") != LOGIN_STORAGE_ORIGIN:
+            continue
+        values = item.get("items")
+        if not isinstance(values, dict):
+            break
+        for value in values.values():
+            if not isinstance(value, str):
+                continue
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            token = decoded.get("refresh_token")
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+    raise _error(
+        "library_login",
+        "authentication_failed",
+        "光鸭登录信息不完整，请重新登录",
+    )
 
 
 def _normalise_directory_path(value: object, *, label: str = "光鸭媒体目录") -> str:
