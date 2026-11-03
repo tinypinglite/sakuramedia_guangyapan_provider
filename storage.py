@@ -1318,22 +1318,45 @@ class GuangyapanStorageProvider:
             parent_id, target_name, _placement_parent_id = self._ensure_placement_directory(
                 placement, operation_key=operation_key
             )
-            token = self._client.upload_token(
-                name=target_name,
-                size=info.size_bytes,
-                parent_id=parent_id,
-                md5=md5.upper(),
+            existing = self._matching_import_files(
+                parent_id,
+                target_name=target_name,
+                source_size=int(info.size_bytes),
+                source_gcid="",
             )
-            if not token.get("instant"):
-                logger.info(
-                    "光鸭迁移未命中秒传，跳过上传 library_id={} operation_key={} name={}",
-                    self.library.library_id, operation_key, info.file_name,
+            if len(existing) > 1:
+                logger.warning(
+                    "光鸭迁移操作目录包含多个匹配结果 library_id={} operation_key={}",
+                    self.library.library_id,
+                    operation_key,
                 )
-                return StagedMediaTransfer(status="not_available")
-            task_id = str(token.get("taskId") or "")
-            if not task_id:
-                return StagedMediaTransfer(status="not_available")
-            uploaded = self._client.wait_upload(task_id)
+                raise _error(
+                    "stage_transfer",
+                    "unavailable",
+                    "光鸭迁移操作目录包含多个匹配结果",
+                    retryable=False,
+                )
+            if existing:
+                uploaded = {"fileId": existing[0]}
+            else:
+                token = self._client.upload_token(
+                    name=target_name,
+                    size=info.size_bytes,
+                    parent_id=parent_id,
+                    md5=md5.upper(),
+                )
+                if not token.get("instant"):
+                    logger.info(
+                        "光鸭迁移未命中秒传，跳过上传 library_id={} operation_key={} name={}",
+                        self.library.library_id, operation_key, info.file_name,
+                    )
+                    return StagedMediaTransfer(status="not_available")
+                task_id = str(token.get("taskId") or "")
+                if not task_id:
+                    return StagedMediaTransfer(status="not_available")
+                uploaded = self._client.wait_upload(task_id)
+        except ProviderOperationError:
+            raise
         except GuangyapanError as exc:
             self._log_failure("stage_transfer", exc, "")
             raise _cloud_error("stage_transfer", exc) from exc

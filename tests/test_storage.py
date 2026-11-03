@@ -809,6 +809,90 @@ def test_stage_transfer_uses_instant_upload_only(
     assert result.file_name == "transfer.mp4"
 
 
+def test_stage_transfer_reuses_existing_operation_file(
+    provider: GuangyapanStorageProvider, tmp_path: Path
+) -> None:
+    payload = b"z" * 1024
+    source_path = tmp_path / "transfer.mp4"
+    source_path.write_bytes(payload)
+    operation_key = "move:reuse"
+    operation_dir_id = _operation_directory(operation_key)
+    client: FakeClient = provider._client  # type: ignore[assignment]
+    client.tree[MEDIA_ROOT] = [{"fileId": "videos", "fileName": "videos", "resType": 2}]
+    client.tree["videos"] = [
+        {"fileId": operation_dir_id, "fileName": operation_dir_id, "resType": 2}
+    ]
+    client.tree[operation_dir_id] = [
+        {
+            "fileId": "existing",
+            "fileName": "transfer.mp4",
+            "resType": 1,
+            "fileSize": len(payload),
+            "fileType": 2,
+        }
+    ]
+
+    result = provider.stage_transfer(
+        source=FakeTransferSource(
+            source_path,
+            content_md5=hashlib.md5(payload).hexdigest().upper(),
+        ),
+        placement=ImportPlacement(relative_path="videos/transfer.mp4"),
+        operation_key=operation_key,
+    )
+
+    assert result.status == "staged"
+    assert result.storage_ref is not None
+    assert result.storage_ref["file_id"] == "existing"
+    assert client.upload_tokens == []
+    assert provider._transfer_journal.get(operation_key) is not None
+
+
+def test_stage_transfer_refuses_multiple_operation_matches(
+    provider: GuangyapanStorageProvider, tmp_path: Path
+) -> None:
+    payload = b"z" * 1024
+    source_path = tmp_path / "transfer.mp4"
+    source_path.write_bytes(payload)
+    operation_key = "move:conflict"
+    operation_dir_id = _operation_directory(operation_key)
+    client: FakeClient = provider._client  # type: ignore[assignment]
+    client.tree[MEDIA_ROOT] = [{"fileId": "videos", "fileName": "videos", "resType": 2}]
+    client.tree["videos"] = [
+        {"fileId": operation_dir_id, "fileName": operation_dir_id, "resType": 2}
+    ]
+    client.tree[operation_dir_id] = [
+        {
+            "fileId": "existing-1",
+            "fileName": "transfer.mp4",
+            "resType": 1,
+            "fileSize": len(payload),
+            "fileType": 2,
+        },
+        {
+            "fileId": "existing-2",
+            "fileName": "transfer.mp4",
+            "resType": 1,
+            "fileSize": len(payload),
+            "fileType": 2,
+        },
+    ]
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.stage_transfer(
+            source=FakeTransferSource(
+                source_path,
+                content_md5=hashlib.md5(payload).hexdigest().upper(),
+            ),
+            placement=ImportPlacement(relative_path="videos/transfer.mp4"),
+            operation_key=operation_key,
+        )
+
+    assert error.value.retryable is False
+    assert client.upload_tokens == []
+    assert client.deleted == []
+
+
 def test_stage_transfer_reports_not_available_without_instant_upload(
     provider: GuangyapanStorageProvider, tmp_path: Path
 ) -> None:
