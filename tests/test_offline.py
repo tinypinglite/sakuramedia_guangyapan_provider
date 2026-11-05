@@ -52,6 +52,8 @@ class FakeClient:
         self.tasks: list[dict[str, Any]] = []
         self.task_id_queries: list[list[str]] = []
         self.bt_res_info: dict[str, Any] = {}
+        self.emule_res_info: dict[str, Any] = {}
+        self.url_res_info: dict[str, Any] = {}
         self.membership = 2
         self.resolve_error: Exception | None = None
         self._next_id = 1000
@@ -102,6 +104,10 @@ class FakeClient:
         self.resolved.append(url)
         if self.resolve_error is not None:
             raise self.resolve_error
+        if url.lower().startswith("ed2k://"):
+            return {"emuleResInfo": dict(self.emule_res_info), "url": url}
+        if url.lower().startswith(("http://", "https://")):
+            return {"urlResInfo": dict(self.url_res_info), "url": url}
         return {"btResInfo": dict(self.bt_res_info), "url": url}
 
     def cloud_resolve_torrent(self, payload: bytes, **_kwargs) -> dict[str, Any]:
@@ -155,6 +161,12 @@ def _provider(tmp_path: Path, client: FakeClient, *, downloads_root_id: str = DO
 
 
 def test_submit_magnet_creates_task_directory_and_is_idempotent(tmp_path: Path) -> None:
+    assert GuangyapanOfflineDownloadComponent.supported_source_kinds == {
+        "magnet",
+        "torrent",
+        "ed2k",
+        "http",
+    }
     client = FakeClient()
     client.bt_res_info = {"infoHash": HASH_A.upper(), "fileName": "ABC-123.mkv", "fileSize": 99}
     provider = _provider(tmp_path, client)
@@ -202,7 +214,9 @@ def test_submit_http_torrent_link_uploads_seed(tmp_path: Path, monkeypatch: pyte
 
     task = provider.submit(
         submission=DownloadSubmission(
-            source_uri="https://indexer.example/download/1", display_name="B-000001"
+            source_uri="https://indexer.example/download/1",
+            display_name="B-000001",
+            source_kind="torrent",
         )
     )
 
@@ -221,12 +235,83 @@ def test_submit_http_link_redirected_to_magnet_skips_torrent_upload(
     provider = _provider(tmp_path, client)
 
     provider.submit(
-        submission=DownloadSubmission(source_uri="https://indexer.example/2", display_name="C-1")
+        submission=DownloadSubmission(
+            source_uri="https://indexer.example/2",
+            display_name="C-1",
+            source_kind="torrent",
+        )
     )
 
     assert client.uploaded_torrents == []
     assert client.resolved == [magnet]
     assert client.created_tasks[0]["url"] == magnet
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_uri", "resource_key", "info_key", "file_name"),
+    [
+        (
+            "ed2k",
+            "ed2k://|file|movie.mp4|12345|0123456789abcdef0123456789abcdef|/",
+            "ed2k:0123456789abcdef0123456789abcdef:12345",
+            "emule_res_info",
+            "movie.mp4",
+        ),
+        (
+            "http",
+            "https://cdn.example/movie.mp4?token=secret",
+            "http:abc123",
+            "url_res_info",
+            "movie.mp4",
+        ),
+    ],
+)
+def test_submit_ed2k_and_http_uses_raw_uri(
+    tmp_path: Path,
+    source_kind: str,
+    source_uri: str,
+    resource_key: str,
+    info_key: str,
+    file_name: str,
+) -> None:
+    client = FakeClient()
+    setattr(client, info_key, {"fileName": file_name, "fileSize": 12345})
+    provider = _provider(tmp_path, client)
+
+    task = provider.submit(
+        submission=DownloadSubmission(
+            source_uri,
+            "ABC-123-ab12cd",
+            source_kind=source_kind,
+            resource_key=resource_key,
+        )
+    )
+
+    assert client.resolved == [source_uri]
+    assert client.created_tasks[0]["url"] == source_uri
+    assert task.remote_id == "task-2"
+    assert [item["fileName"] for item in client.tree[DOWNLOADS_ROOT]] == [
+        "ABC-123-ab12cd"
+    ]
+
+
+def test_delete_non_bt_task_uses_recorded_task_id(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.emule_res_info = {"fileName": "movie.mp4", "fileSize": 12345}
+    provider = _provider(tmp_path, client)
+    source = "ed2k://|file|movie.mp4|12345|0123456789abcdef0123456789abcdef|/"
+    task = provider.submit(
+        submission=DownloadSubmission(
+            source,
+            "ABC-123-ab12cd",
+            source_kind="ed2k",
+            resource_key="ed2k:0123456789abcdef0123456789abcdef:12345",
+        )
+    )
+
+    provider.delete_task(remote_id=task.remote_id, delete_files=True)
+
+    assert client.deleted_task_ids == ["task-2"]
 
 
 def test_submit_rejects_invalid_magnet_and_bt_not_found(tmp_path: Path) -> None:

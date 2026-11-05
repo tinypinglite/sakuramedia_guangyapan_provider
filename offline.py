@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 from loguru import logger
@@ -140,13 +141,67 @@ def _info_hash_of_magnet(value: str) -> str:
 
 
 def _info_hash_of_source(value: object) -> str:
-    """从任务记录的 `res` 字段反解 infoHash（BT 任务是 magnet，HTTP 任务反解不出）。"""
-    if not isinstance(value, str) or not value.lower().startswith("magnet:"):
+    """Resolve a task `res` value to the journal key used by this provider."""
+    if not isinstance(value, str):
         return ""
-    try:
-        return _info_hash_of_magnet(value)
-    except ValueError:
+    text = value.strip()
+    if text.lower().startswith("magnet:"):
+        try:
+            return _info_hash_of_magnet(text)
+        except ValueError:
+            return ""
+    if text.lower().startswith("ed2k://"):
+        parts = text.split("|")
+        if len(parts) >= 6:
+            try:
+                size = int(parts[3])
+            except ValueError:
+                return ""
+            info_hash = parts[4].strip().lower()
+            if re.fullmatch(r"[0-9a-f]{32}", info_hash) and size > 0:
+                return f"ed2k:{info_hash}:{size}"
         return ""
+    if text.lower().startswith(("http://", "https://")):
+        try:
+            return "http:" + _http_url_key(text)
+        except ValueError:
+            return ""
+    return ""
+
+
+def _http_url_key(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("invalid http url")
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if not host:
+        raise ValueError("invalid http url")
+    port = parsed.port
+    if port is None or (parsed.scheme.lower() == "http" and port == 80) or (
+        parsed.scheme.lower() == "https" and port == 443
+    ):
+        netloc = host
+    else:
+        netloc = f"{host}:{port}"
+    normalized = urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, "")
+    )
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _ed2k_file_info(value: str) -> tuple[str, int]:
+    parts = value.split("|")
+    if len(parts) >= 6:
+        try:
+            return unquote(parts[2].strip()), int(parts[3])
+        except ValueError:
+            pass
+    return "", 0
+
+
+def _http_file_info(value: str) -> tuple[str, int]:
+    name = unquote(urlsplit(value).path.rsplit("/", 1)[-1])
+    return name, 0
 
 
 def _magnet_of_info_hash(info_hash: str) -> str:
@@ -209,6 +264,7 @@ class GuangyapanOfflineDownloadComponent:
     """下载组件边界：没有额外配置字段（配置都在媒体库上）。"""
 
     config_fields: tuple[ConfigField, ...] = ()
+    supported_source_kinds = frozenset({"magnet", "torrent", "ed2k", "http"})
 
     def __init__(
         self,
@@ -296,62 +352,114 @@ class GuangyapanOfflineDownloadProvider:
         source_uri = (submission.source_uri or "").strip()
         if not source_uri:
             raise _error("submit_download", "invalid_config", "下载链接不能为空")
+        source_kind = submission.source_kind
+        if source_kind is None:
+            source_kind = (
+                "magnet"
+                if source_uri.lower().startswith("magnet:")
+                else "ed2k"
+                if source_uri.lower().startswith("ed2k://")
+                else "http"
+                if source_uri.lower().startswith(("http://", "https://"))
+                else "torrent"
+            )
         display_name = _safe_dir_name(submission.display_name)
 
         with self._client_factory(self._refresh_token) as client:
-            magnet, info_hash, file_name, file_size = self._resolve_source(client, source_uri)
-            recorded = self._journal.get(info_hash)
+            submit_uri, info_hash, file_name, file_size = self._resolve_source(
+                client, source_uri, source_kind
+            )
+            resource_key = (submission.resource_key or "").strip()
+            if not resource_key:
+                resource_key = (
+                    f"bt:{info_hash}"
+                    if info_hash
+                    else _info_hash_of_source(source_uri)
+                )
+            journal_key = info_hash or resource_key
+            if not journal_key:
+                raise _error(
+                    "submit_download", "invalid_config", "无法识别下载资源标识"
+                )
+            recorded = self._journal.get(journal_key)
             if recorded is not None:
                 # 幂等：宿主重试同一次提交时不能再建一个任务
                 logger.info(
-                    "光鸭下载任务复用已有记录 library_id={} info_hash={} task_id={}",
+                    "光鸭下载任务复用已有记录 library_id={} source_kind={} key={} task_id={}",
                     self.library.library_id,
-                    info_hash,
+                    source_kind,
+                    journal_key,
                     recorded.get("task_id"),
                 )
-                return self._task_of(recorded, info_hash, state="queued", progress=0.0)
+                return self._task_of(recorded, journal_key, state="queued", progress=0.0)
 
-            directory_id = self._ensure_task_directory(client, display_name or info_hash)
-            created = client.cloud_create_task(magnet, parent_id=directory_id)
+            directory_name = display_name or _safe_dir_name(file_name) or journal_key
+            directory_id = self._ensure_task_directory(client, directory_name)
+            created = client.cloud_create_task(submit_uri, parent_id=directory_id)
             task_id = str(created.get("taskId") or "")
             if not task_id:
                 raise _error("submit_download", "unavailable", "光鸭未返回云添加任务 ID", retryable=True)
+            remote_id = info_hash or task_id
             record: dict[str, Any] = {
                 "task_id": task_id,
                 "dir_id": directory_id,
                 "info_hash": info_hash,
-                "dir_name": display_name or info_hash,
+                "resource_key": resource_key,
+                "source_kind": source_kind,
+                "remote_id": remote_id,
+                "dir_name": directory_name,
                 "file_name": file_name,
                 "file_size": file_size,
             }
-            self._journal.put(info_hash, record)
+            self._journal.put(journal_key, record)
 
         logger.info(
-            "光鸭下载任务已提交 library_id={} info_hash={} task_id={} dir_id={} name={}",
+            "光鸭下载任务已提交 library_id={} source_kind={} key={} task_id={} dir_id={} name={}",
             self.library.library_id,
-            info_hash,
+            source_kind,
+            journal_key,
             task_id,
             directory_id,
             record["dir_name"],
         )
-        return self._task_of(record, info_hash, state="queued", progress=0.0)
+        return self._task_of(record, journal_key, state="queued", progress=0.0)
 
     def _resolve_source(
-        self, client: GuangyapanClient, source_uri: str
-    ) -> tuple[str, str, str, int]:
-        """把 source_uri 归一成 `(magnet, info_hash, file_name, file_size)`。"""
+        self, client: GuangyapanClient, source_uri: str, source_kind: str
+    ) -> tuple[str, str | None, str, int]:
+        """把 source_uri 归一成提交 URI、BT hash 和文件信息。"""
         try:
-            if source_uri.lower().startswith("magnet:"):
+            if source_kind not in {"magnet", "torrent", "ed2k", "http"}:
+                raise ValueError("invalid source kind")
+            if source_kind in {"magnet", "torrent"} and source_uri.lower().startswith(
+                "magnet:"
+            ):
                 info_hash = _info_hash_of_magnet(source_uri)
                 return self._from_bt_res_info(client, _magnet_of_info_hash(info_hash), info_hash)
+            if source_kind in {"ed2k", "http"}:
+                data = client.cloud_resolve(source_uri)
+                key = "emuleResInfo" if source_kind == "ed2k" else "urlResInfo"
+                name, size = (
+                    _ed2k_file_info(source_uri)
+                    if source_kind == "ed2k"
+                    else _http_file_info(source_uri)
+                )
+                info = data.get(key)
+                if not isinstance(info, dict):
+                    info = {}
+                name = str(info.get("fileName") or info.get("name") or name)
+                raw_size = info.get("fileSize") or info.get("size") or size
+                file_size = int(raw_size) if isinstance(raw_size, (int, float)) else 0
+                return source_uri, None, name, file_size
             kind, payload = _fetch_torrent(source_uri)
             if kind == "magnet":
                 info_hash = _info_hash_of_magnet(str(payload))
                 return self._from_bt_res_info(client, _magnet_of_info_hash(info_hash), info_hash)
             data = client.cloud_resolve_torrent(payload)
-            return self._bt_tuple(data)
+            magnet, info_hash, file_name, file_size = self._bt_tuple(data)
+            return magnet, info_hash, file_name, file_size
         except ValueError as exc:
-            raise _error("submit_download", "invalid_config", "磁力链接无效") from exc
+            raise _error("submit_download", "invalid_config", "下载链接无效") from exc
         except GuangyapanError as exc:
             logger.warning(
                 "光鸭下载源解析失败 library_id={} error_type={} reason={}",
@@ -445,7 +553,7 @@ class GuangyapanOfflineDownloadProvider:
     def _remote_task(
         self,
         client: GuangyapanClient,
-        info_hash: str,
+        journal_key: str,
         record: JsonObject,
         item: JsonObject,
         *,
@@ -463,14 +571,14 @@ class GuangyapanOfflineDownloadProvider:
                 # 落盘后 30–60 秒内读会 0 字节：先按进行中上报，下一轮再转完成，
                 # 否则宿主会立刻导入一个 0 字节文件（endpoints.md §0.3）。
                 logger.info(
-                    "光鸭下载任务已到终态但产物未就绪，延后上报完成 library_id={} info_hash={}",
+                    "光鸭下载任务已到终态但产物未就绪，延后上报完成 library_id={} key={}",
                     self.library.library_id,
-                    info_hash,
+                    journal_key,
                 )
                 state = "downloading"
-        name = str(record.get("dir_name") or item.get("fileName") or info_hash)
+        name = str(record.get("dir_name") or item.get("fileName") or journal_key)
         return RemoteDownloadTask(
-            remote_id=info_hash,
+            remote_id=str(record.get("remote_id") or journal_key),
             name=name,
             state=state,  # type: ignore[arg-type]
             progress=_progress_of(item),
@@ -516,14 +624,14 @@ class GuangyapanOfflineDownloadProvider:
     def _task_of(
         self,
         record: JsonObject,
-        info_hash: str,
+        journal_key: str,
         *,
         state: str,
         progress: float,
     ) -> RemoteDownloadTask:
         return RemoteDownloadTask(
-            remote_id=info_hash,
-            name=str(record.get("dir_name") or info_hash),
+            remote_id=str(record.get("remote_id") or journal_key),
+            name=str(record.get("dir_name") or journal_key),
             state=state,  # type: ignore[arg-type]
             progress=progress,
             completed_source_ref=None,
@@ -532,21 +640,22 @@ class GuangyapanOfflineDownloadProvider:
     # ---------------------------------------------------------------- 删除
 
     def delete_task(self, *, remote_id: str, delete_files: bool) -> None:
-        try:
-            info_hash = _canonical_btih(str(remote_id or ""))
-        except ValueError as exc:
-            raise _error("delete_download", "invalid_config", "光鸭下载任务标识无效") from exc
-        record = self._journal.get(info_hash)
+        remote_id = str(remote_id or "").strip()
+        if not remote_id:
+            raise _error("delete_download", "invalid_config", "光鸭下载任务标识无效")
+        journal_key, record = self._record_for_remote_id(remote_id)
+        if record is None and not journal_key:
+            raise _error("delete_download", "invalid_config", "光鸭下载任务标识无效")
         task_id = str(record.get("task_id") or "") if record else ""
         try:
             with self._client_factory(self._refresh_token) as client:
                 if not task_id:
-                    task_id = self._find_task_id(client, info_hash)
+                    task_id = self._find_task_id(client, journal_key or remote_id)
                 if task_id:
                     try:
                         client.cloud_delete_tasks([task_id])
                     except GuangyapanNotFoundError:
-                        logger.info("光鸭下载任务记录已不存在 info_hash={}", info_hash)
+                        logger.info("光鸭下载任务记录已不存在 remote_id={}", remote_id)
                 if delete_files and record:
                     directory_id = record.get("dir_id")
                     if isinstance(directory_id, str) and directory_id:
@@ -555,25 +664,43 @@ class GuangyapanOfflineDownloadProvider:
                         except GuangyapanError as exc:
                             # 尽力而为：任务记录已删成功，目录清理失败只告警，不阻塞宿主台账
                             logger.warning(
-                                "光鸭下载目录清理失败 library_id={} info_hash={} error_type={} reason={}",
+                                "光鸭下载目录清理失败 library_id={} key={} error_type={} reason={}",
                                 self.library.library_id,
-                                info_hash,
+                                journal_key,
                                 type(exc).__name__,
                                 safe_error_message(exc),
                             )
         except GuangyapanError as exc:
             logger.warning(
-                "光鸭下载任务删除失败 library_id={} info_hash={} error_type={} reason={}",
+                "光鸭下载任务删除失败 library_id={} key={} error_type={} reason={}",
                 self.library.library_id,
-                info_hash,
+                journal_key or remote_id,
                 type(exc).__name__,
                 safe_error_message(exc),
             )
             raise _cloud_error("delete_download", exc) from exc
-        self._journal.remove(info_hash)
+        if journal_key:
+            self._journal.remove(journal_key)
 
-    def _find_task_id(self, client: GuangyapanClient, info_hash: str) -> str:
-        """journal 丢了（插件 data 被清）时按任务列表里的 magnet 兜底找。"""
+    def _record_for_remote_id(
+        self, remote_id: str
+    ) -> tuple[str, JsonObject | None]:
+        record = self._journal.get(remote_id)
+        if record is not None:
+            return remote_id, record
+        for key, candidate in self._journal.items().items():
+            if str(candidate.get("task_id") or "") == remote_id:
+                return key, candidate
+            if str(candidate.get("resource_key") or "") == remote_id:
+                return key, candidate
+        try:
+            legacy_key = _canonical_btih(remote_id)
+        except ValueError:
+            return "", None
+        return legacy_key, self._journal.get(legacy_key)
+
+    def _find_task_id(self, client: GuangyapanClient, journal_key: str) -> str:
+        """journal 丢了（插件 data 被清）时按任务列表里的来源兜底找。"""
         try:
             pages = tuple(client.iter_cloud_tasks())
         except GuangyapanError:
@@ -583,6 +710,6 @@ class GuangyapanOfflineDownloadProvider:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                if _info_hash_of_source(item.get("res")) == info_hash:
+                if _info_hash_of_source(item.get("res")) == journal_key:
                     return str(item.get("taskId") or "")
         return ""
