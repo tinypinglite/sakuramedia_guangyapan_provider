@@ -10,7 +10,6 @@ import json
 from pathlib import Path, PurePosixPath
 
 from loguru import logger
-
 from src.plugins import PluginContext, PluginExtension, PluginRegistration
 from src.plugins.provider_protocol import (
     MEDIA_PROVIDER_EXTENSION_KEY,
@@ -127,6 +126,7 @@ class GuangyapanMediaProviderBundle:
     library_config_fields = LIBRARY_CONFIG_FIELDS
     library_login = LIBRARY_LOGIN
     playback_deliveries = ("redirect", "proxy")
+    merged_playback_format = "mp4"
 
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)

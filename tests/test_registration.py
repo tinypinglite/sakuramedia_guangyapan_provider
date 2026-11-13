@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 from sakuramedia_guangyapan_provider.plugin import PLUGIN_ID, register
-
 from src.plugins import PluginContext
 from src.plugins.extensions.media_provider import validate_media_provider_extension
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
@@ -19,11 +18,12 @@ def test_registration_declares_provider(tmp_path: Path) -> None:
     bundle = validate_media_provider_extension(plugin_id=PLUGIN_ID, extension=extension)
 
     assert registration.host_api_version == manifest["host_api_version"]
-    assert manifest["version"] == "0.1.4"
+    assert manifest["version"] == "0.1.5-beta.1"
     assert manifest["host_api_version"] == 18
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "guangyapan"
     assert bundle.playback_deliveries == ("redirect", "proxy")
+    assert bundle.merged_playback_format == "mp4"
     assert bundle.downloads is not None
     assert tuple(bundle.downloads.config_fields) == ()
     assert bundle.library_login.start_url == "https://www.guangyapan.com/"

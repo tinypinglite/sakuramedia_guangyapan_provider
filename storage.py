@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -23,7 +24,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from loguru import logger
-
 from src.plugins.provider_protocol import (
     BrowseEntry,
     BrowsePage,
@@ -58,6 +58,10 @@ from .exceptions import (
 from .guangya import GuangyapanClient
 from .journal import OperationJournal
 from .library_tree import load_library_tree
+from .merged_mp4 import Mp4MergeError
+from .merged_playback import build_layout as build_merged_layout
+from .merged_playback import merged_range_requests_response
+from .merged_source import GuangyapanMergedSource
 from .playback import GuangyapanPlayback
 from .pyav_tools import create_clip as _create_clip
 from .pyav_tools import generate_thumbnails as _generate_thumbnails
@@ -1099,6 +1103,77 @@ class GuangyapanStorageProvider:
 
     async def handle_playback(self, *, media: MediaHandle, context):
         return await self._playback.handle(media=media, context=context)
+
+    async def handle_merged_playback(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        context,
+    ):
+        if context.resource_path != "stream.mp4":
+            raise _error(
+                "merged_playback",
+                "source_not_found",
+                "光鸭合并播放资源不存在",
+            )
+        try:
+            layout = await asyncio.to_thread(
+                self._build_merged_layout,
+                medias=medias,
+            )
+        except GuangyapanError as exc:
+            self._log_failure("merged_playback", exc, "")
+            raise _cloud_error("merged_playback", exc) from exc
+        return merged_range_requests_response(
+            context.request,
+            layout,
+            "video/mp4",
+        )
+
+    def preflight_merged_playback(self, *, medias: tuple[MediaHandle, ...]) -> None:
+        self._build_merged_layout(medias=medias)
+
+    def _build_merged_layout(self, *, medias: tuple[MediaHandle, ...]):
+        sources = []
+        for media in medias:
+            file_id = _entry_file_id(
+                media.storage_ref,
+                operation="merged_playback",
+            )
+            size = media.file_size_bytes
+            sources.append(
+                (
+                    media.media_id,
+                    GuangyapanMergedSource(
+                        size=size,
+                        identity=(
+                            "guangyapan",
+                            media.media_id,
+                            size,
+                            file_id,
+                            media.content_sha1,
+                            (media.storage_ref or {}).get("gcid"),
+                        ),
+                        reader_factory=lambda length, file_id=file_id, size=size: self._reader(
+                            file_id,
+                            file_size=size,
+                            max_fetched_bytes=length,
+                            chunk_size=max(64 * 1024, min(1024 * 1024, length)),
+                        ),
+                    ),
+                )
+            )
+        try:
+            return build_merged_layout(sources)
+        except Mp4MergeError as exc:
+            raise _error(
+                "merged_playback",
+                "unsupported",
+                exc.message,
+            ) from exc
+        except GuangyapanError as exc:
+            self._log_failure("merged_playback", exc, "")
+            raise _cloud_error("merged_playback", exc) from exc
 
     # ---------------------------------------------------------------- 缩略图 / 剪辑
 
